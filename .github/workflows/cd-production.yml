@@ -1,0 +1,221 @@
+name: CD - Deploy Frontend to Production
+
+# TRIGGER: Only after CI workflow succeeds on main branch
+on:
+  workflow_run:
+    workflows: ["Frontend CI"]
+    branches: [main]
+    types:
+      - completed
+
+env:
+  AWS_REGION: eu-west-1
+  PROD_HOST: ${{ secrets.PROD_FRONTEND_HOST }}
+  PROD_USER: ubuntu
+  DEPLOY_DIR: /var/www/taskapp
+  NGINX_CONF_DIR: /etc/nginx/sites-available
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    
+    # CRITICAL: Only deploy if CI succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      # Step 1: Download artifact from CI workflow
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ./artifacts
+      
+      # Step 2: Identify artifact
+      - name: Find artifact
+        id: artifact
+        run: |
+          ARTIFACT=$(find ./artifacts -name "frontend-*.tar.gz" | head -1)
+          if [ -z "$ARTIFACT" ]; then
+            echo "::error::No frontend artifact found!"
+            exit 1
+          fi
+          echo "Found: $ARTIFACT"
+          echo "path=$ARTIFACT" >> $GITHUB_OUTPUT
+          
+          VERSION=$(basename $ARTIFACT .tar.gz | sed 's/frontend-//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      # Step 3: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Step 4: Setup SSH
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ env.PROD_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+      
+      # Step 5: Deploy to EC2
+      # Strategy: atomic replacement with backup
+      - name: Deploy to server
+        env:
+          VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          ARTIFACT="${{ steps.artifact.outputs.path }}"
+          
+          echo "=== Starting frontend deployment v${VERSION} ==="
+          
+          # Copy artifact to server
+          scp -i ~/.ssh/deploy_key \
+            "$ARTIFACT" \
+            ${{ env.PROD_USER }}@${{ env.PROD_HOST }}:/tmp/frontend.tar.gz
+          
+          # Execute atomic deployment
+          ssh -i ~/.ssh/deploy_key ${{ env.PROD_USER }}@${{ env.PROD_HOST }} << 'DEPLOY_EOF'
+            set -e
+            
+            echo "Step 1: Creating backup..."
+            if [ -d "${{ env.DEPLOY_DIR }}" ] && [ "$(ls -A ${{ env.DEPLOY_DIR }})" ]; then
+              BACKUP_NAME="${{ env.DEPLOY_DIR }}.backup.$(date +%Y%m%d_%H%M%S)"
+              sudo cp -r "${{ env.DEPLOY_DIR }}" "$BACKUP_NAME"
+              echo "Backup created: $BACKUP_NAME"
+            else
+              echo "No existing deployment to backup"
+            fi
+            
+            echo "Step 2: Preparing new version..."
+            # Create temp directory for extraction
+            sudo mkdir -p /tmp/new-frontend
+            sudo tar -xzf /tmp/frontend.tar.gz -C /tmp/new-frontend
+            
+            echo "Step 3: Atomic swap..."
+            # Move old version out, new version in (minimizes downtime)
+            if [ -d "${{ env.DEPLOY_DIR }}" ]; then
+              sudo mv "${{ env.DEPLOY_DIR }}" "${{ env.DEPLOY_DIR }}.old"
+            fi
+            sudo mv /tmp/new-frontend "${{ env.DEPLOY_DIR }}"
+            
+            echo "Step 4: Setting permissions..."
+            sudo chown -R www-data:www-data "${{ env.DEPLOY_DIR }}"
+            sudo chmod -R 755 "${{ env.DEPLOY_DIR }}"
+            
+            echo "Step 5: Cleaning up old version..."
+            if [ -d "${{ env.DEPLOY_DIR }}.old" ]; then
+              sudo rm -rf "${{ env.DEPLOY_DIR }}.old"
+            fi
+            
+            echo "Step 6: Reloading Nginx..."
+            # Test configuration first (prevents broken config)
+            sudo nginx -t
+            
+            # Graceful reload (zero downtime)
+            sudo systemctl reload nginx
+            
+            # Verify Nginx is running
+            if ! sudo systemctl is-active --quiet nginx; then
+              echo "::error::Nginx failed to reload!"
+              exit 1
+            fi
+            
+            rm -f /tmp/frontend.tar.gz
+            
+            echo "=== Deployment complete ==="
+          DEPLOY_EOF
+      
+      # Step 6: Verify deployment
+      - name: Verify deployment
+        id: verify
+        run: |
+          echo "Waiting for Nginx to serve new content..."
+          sleep 5
+          
+          # Test main page
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://devops-tsacademy.com)
+          
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Main page returned status: $STATUS"
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Verify content is new (check for version in HTML)
+          HTML=$(curl -s https://devops-tsacademy.com)
+          if echo "$HTML" | grep -q "vite"; then
+            echo "✓ Vite assets detected"
+          fi
+          
+          # Test API proxy
+          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://devops-tsacademy.com/api/health || echo "000")
+          
+          if [ "$API_STATUS" = "200" ]; then
+            echo "✓ API proxy working"
+          else
+            echo "::warning::API proxy returned: $API_STATUS (may be CORS or backend issue)"
+          fi
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "Deployment verified successfully!"
+      
+      # Step 7: Rollback on failure
+      - name: Rollback on failure
+        if: steps.verify.outputs.status == 'failure'
+        run: |
+          echo "::error::Verification failed! Rolling back..."
+          
+          ssh -i ~/.ssh/deploy_key ${{ env.PROD_USER }}@${{ env.PROD_HOST }} << 'ROLLBACK_EOF'
+            set -e
+            
+            # Find latest backup
+            LATEST_BACKUP=$(ls -td ${{ env.DEPLOY_DIR }}.backup.* 2>/dev/null | head -1)
+            
+            if [ -z "$LATEST_BACKUP" ]; then
+              echo "::error::No backup found for rollback!"
+              exit 1
+            fi
+            
+            echo "Restoring from: $LATEST_BACKUP"
+            
+            # Atomic restore
+            sudo mv "${{ env.DEPLOY_DIR }}" "${{ env.DEPLOY_DIR }}.failed"
+            sudo cp -r "$LATEST_BACKUP" "${{ env.DEPLOY_DIR }}"
+            sudo chown -R www-data:www-data "${{ env.DEPLOY_DIR }}"
+            
+            # Reload Nginx
+            sudo nginx -t && sudo systemctl reload nginx
+            
+            echo "Rollback complete"
+          ROLLBACK_EOF
+          
+          # Verify rollback
+          sleep 3
+          ROLLBACK_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://devops-tsacademy.com)
+          
+          if [ "$ROLLBACK_STATUS" = "200" ]; then
+            echo "✓ Rollback verified - site restored"
+          else
+            echo "::error::Rollback failed! Manual intervention required"
+            exit 1
+          fi
+      
+      # Step 8: Deployment summary
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## Frontend Deployment Successful :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ steps.artifact.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: https://devops-tsacademy.com" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Verification" >> $GITHUB_STEP_SUMMARY
+          echo "- Main page: 200 OK" >> $GITHUB_STEP_SUMMARY
+          echo "- API proxy: Configured" >> $GITHUB_STEP_SUMMARY

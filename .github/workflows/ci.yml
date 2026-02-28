@@ -1,0 +1,166 @@
+name: Frontend CI
+
+# TRIGGER: Run on every push to main and every pull request
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'package*.json'
+      - 'tsconfig*.json'
+      - 'vite.config.ts'
+      - 'tailwind.config.js'
+      - 'index.html'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # JOB 1: VALIDATE
+  # Fast feedback: catch errors before building
+  # ═══════════════════════════════════════════════════════════
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1.1: Checkout repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 1.2: Setup Node.js with npm caching
+      # Caching node_modules cuts 2-3 minutes from build time
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      # Step 1.3: Clean install dependencies
+      # npm ci uses package-lock.json for reproducible builds
+      - name: Install dependencies
+        run: npm ci
+      
+      # Step 1.4: Run ESLint
+      # Catches code quality issues and potential bugs
+      - name: Run linter
+        run: npm run lint
+      
+      # Step 1.5: TypeScript type checking
+      # Catches type errors without emitting files
+      - name: Type check
+        run: npm run typecheck
+      
+      # Step 1.6: Check for uncommitted changes (optional safety)
+      - name: Verify no generated files
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::warning::Uncommitted changes detected"
+            git status
+          fi
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 2: BUILD
+  # Create optimized production bundle
+  # ═══════════════════════════════════════════════════════════
+  build:
+    name: Build Production Bundle
+    runs-on: ubuntu-latest
+    needs: validate  # Only build if validation passes
+    
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      artifact-name: ${{ steps.artifact.outputs.name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for versioning
+      
+      # Step 2.1: Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      # Step 2.2: Install dependencies
+      - name: Install dependencies
+        run: npm ci
+      
+      # Step 2.3: Generate version string
+      - name: Generate version
+        id: version
+        run: |
+          GIT_DESC=$(git describe --tags --always --dirty 2>/dev/null || git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          VERSION="${GIT_DESC}-${TIMESTAMP}"
+          echo "value=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+      
+      # Step 2.4: Build for production
+      # CRITICAL: VITE_API_URL must point to live backend
+      - name: Build application
+        env:
+          VITE_API_URL: https://api.devops-tsacademy.com/api
+          NODE_ENV: production
+        run: npm run build
+      
+      # Step 2.5: Verify build output
+      - name: Verify build
+        run: |
+          echo "Build output contents:"
+          ls -la dist/
+          
+          # Critical: index.html must exist
+          if [ ! -f dist/index.html ]; then
+            echo "::error::Build failed: index.html not found!"
+            exit 1
+          fi
+          
+          # Check for hashed assets (cache busting working)
+          echo "JavaScript assets:"
+          ls -la dist/assets/*.js 2>/dev/null || echo "No JS assets found"
+          
+          echo "CSS assets:"
+          ls -la dist/assets/*.css 2>/dev/null || echo "No CSS assets found"
+      
+      # Step 2.6: Create deployment tarball
+      # Tar preserves directory structure, faster than SCP of many files
+      - name: Create artifact
+        run: |
+          tar -czf frontend-${{ steps.version.outputs.value }}.tar.gz -C dist .
+          
+          echo "Artifact contents:"
+          tar -tzf frontend-${{ steps.version.outputs.value }}.tar.gz
+      
+      # Step 2.7: Set outputs for downstream jobs
+      - name: Set artifact name
+        id: artifact
+        run: echo "name=frontend-${{ steps.version.outputs.value }}" >> $GITHUB_OUTPUT
+      
+      # Step 2.8: Upload to GitHub artifact storage
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-${{ steps.version.outputs.value }}
+          path: frontend-${{ steps.version.outputs.value }}.tar.gz
+          retention-days: 30
+      
+      # Step 2.9: Build summary for GitHub UI
+      - name: Build summary
+        run: |
+          echo "## Build Complete :package:" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ steps.version.outputs.value }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Vite API URL: \`https://api.devops-tsacademy.com/api\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Output Files" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la dist/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
